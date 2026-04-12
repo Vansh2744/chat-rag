@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
 from app.utils.token_utils import check_token_limit, add_tokens
+from functools import lru_cache
 
 load_dotenv()
 
@@ -27,11 +28,14 @@ router = APIRouter(tags=["chat-youtube"])
 
 embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2-preview")
 
-vectorstore = PGVector(
-    embeddings=embeddings,
-    collection_name="uploaded_file_data",
-    connection=os.environ.get("POSTGRES_URI"),
-)
+@lru_cache(maxsize=1)
+def get_vectorstore():
+    return PGVector(
+        embeddings=embeddings,
+        collection_name="uploaded_file_data",
+        connection=os.environ.get("POSTGRES_URI"),
+        pre_delete_collection=False,
+    )
 
 llm = ChatGroq(model="llama-3.3-70b-versatile", streaming=True)
 
@@ -98,7 +102,7 @@ def embed_youtube_video(yt_url: str, user_id: str, db: Session) -> dict:
     for split in splits:
         split.metadata.update({"doc_id": doc_id, "source_type": "youtube", "user_id": user_id})
 
-    vectorstore.add_documents(splits)
+    get_vectorstore().add_documents(splits)
 
     db_doc = EmbeddedDocs(
         doc_name=video_title,
@@ -134,7 +138,6 @@ async def chat_with_yt(
     doc_id: str = Form(...),
     db: Session = Depends(get_db),
 ):
-    # 1. Check limit BEFORE doing anything
     usage = check_token_limit(user_id, db)
 
     doc = (
@@ -145,7 +148,7 @@ async def chat_with_yt(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    results = vectorstore.similarity_search(question, k=5, filter={"doc_id": doc_id})
+    results = get_vectorstore().similarity_search(question, k=5, filter={"doc_id": doc_id})
     if not results:
         raise HTTPException(status_code=404, detail="No relevant content found")
 
@@ -166,7 +169,6 @@ async def chat_with_yt(
                 total_chars += len(chunk.content)
                 yield f"data: {json.dumps({'content': chunk.content})}\n\n"
 
-        # Rough token estimate: ~4 chars per token
         estimated_tokens = (total_chars + len(question) + len(context)) // 4
         add_tokens(usage, estimated_tokens, db)
         yield "data: [DONE]\n\n"

@@ -16,6 +16,7 @@ from langchain_groq import ChatGroq
 import json
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from app.utils.token_utils import check_token_limit, add_tokens
+from functools import lru_cache
 
 load_dotenv()
 
@@ -27,11 +28,14 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2-preview")
 llm = ChatGroq(model="llama-3.3-70b-versatile", streaming=True)
 
-vectorstore = PGVector(
-    embeddings=embeddings,
-    collection_name="uploaded_file_data",
-    connection=os.environ.get("POSTGRES_URI"),
-)
+@lru_cache(maxsize=1)
+def get_vectorstore():
+    return PGVector(
+        embeddings=embeddings,
+        collection_name="uploaded_file_data",
+        connection=os.environ.get("POSTGRES_URI"),
+        pre_delete_collection=False,
+    )
 
 
 def load_pdf(path: str):
@@ -76,7 +80,7 @@ async def file_upload(
 
     splits, doc_id = split_docs(docs)
 
-    vectorstore.add_documents(splits)
+    get_vectorstore().add_documents(splits)
 
     Path.unlink(file_path)
 
@@ -113,7 +117,7 @@ async def chat_with_pdf(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    results = vectorstore.similarity_search(question, k=5, filter={"doc_id": doc_id})
+    results = get_vectorstore().similarity_search(question, k=5, filter={"doc_id": doc_id})
     if not results:
         raise HTTPException(status_code=404, detail="No relevant content found")
 
@@ -134,7 +138,6 @@ async def chat_with_pdf(
                 total_chars += len(chunk.content)
                 yield f"data: {json.dumps({'content': chunk.content})}\n\n"
 
-        # Rough token estimate: ~4 chars per token
         estimated_tokens = (total_chars + len(question) + len(context)) // 4
         add_tokens(usage, estimated_tokens, db)
         yield "data: [DONE]\n\n"
