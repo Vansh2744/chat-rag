@@ -1,4 +1,4 @@
-import React, { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { UserContext } from "./userContext";
 import axios from "axios";
 import { backendUrl } from "../../utils/backendUrl";
