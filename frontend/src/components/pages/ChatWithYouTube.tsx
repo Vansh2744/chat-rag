@@ -48,6 +48,7 @@ export function ChatWithYouTube() {
   useEffect(() => {
     fetchVideos();
   }, []);
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
@@ -95,7 +96,6 @@ export function ChatWithYouTube() {
             : `HTTP ${err.response?.status ?? "?"} — Failed to process video.`;
       setProcessError(msg);
       setProcessStep("error");
-
       console.error("process-video error:", err.response?.data);
     }
   };
@@ -111,7 +111,7 @@ export function ChatWithYouTube() {
     try {
       const formData = new FormData();
       formData.append("question", userMsg.content);
-      formData.append("user_id", user!.id);
+      formData.append("user_id", String(user!.id));
       formData.append("doc_id", selectedDocId);
 
       const response = await fetch(`${backendUrl}/yt-chat/chat/`, {
@@ -174,8 +174,12 @@ export function ChatWithYouTube() {
             </p>
           </div>
         </div>
-
-        {videos.length > 0 && (
+        {loadingVideos ? (
+          <div className="flex items-center gap-2 text-xs text-slate-500">
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            Loading videos...
+          </div>
+        ) : videos.length > 0 ? (
           <div className="relative">
             <select
               value={selectedDocId}
@@ -193,7 +197,7 @@ export function ChatWithYouTube() {
             </select>
             <ChevronDown className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-slate-600 w-3 h-3" />
           </div>
-        )}
+        ) : null}
       </div>
       <div className="flex-shrink-0 rounded-xl border border-slate-800 bg-slate-900/50 p-4 space-y-3">
         <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
@@ -369,9 +373,11 @@ export function ChatWithYouTube() {
           )}
         </button>
       </div>
+
       <p className="flex-shrink-0 text-center text-[11px] text-slate-700 -mt-2">
         Enter to send · Shift+Enter for new line
       </p>
+
       <TokenLimitModal
         isOpen={showModal}
         onClose={closeModal}
