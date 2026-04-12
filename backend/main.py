@@ -4,12 +4,16 @@ from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from app.db.db import Base, engine
+from contextlib import asynccontextmanager
 
 load_dotenv()
 
-Base.metadata.create_all(bind=engine)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    yield
 
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
