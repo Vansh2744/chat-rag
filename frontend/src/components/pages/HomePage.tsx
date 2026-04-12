@@ -1,5 +1,5 @@
 import { useNavigate } from "react-router-dom";
-import { FileText, Youtube, Sparkles } from "lucide-react";
+import { FileText, Youtube } from "lucide-react";
 
 export default function HomePage() {
   const navigate = useNavigate();
