@@ -2,7 +2,6 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form
 from pathlib import Path
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 from langchain_postgres import PGVector
 from dotenv import load_dotenv
 import os
@@ -15,9 +14,8 @@ from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq 
 import json
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from app.utils.token_utils import check_token_limit, add_tokens
-from transformers import logging
-logging.set_verbosity_error()
 
 load_dotenv()
 
@@ -26,7 +24,7 @@ router = APIRouter(tags=["pdf-chat"])
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
+embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2-preview")
 llm = ChatGroq(model="llama-3.3-70b-versatile", streaming=True)
 
 vectorstore = PGVector(

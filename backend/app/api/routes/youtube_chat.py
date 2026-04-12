@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends, Form
 from fastapi.responses import StreamingResponse
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_postgres import PGVector
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_groq import ChatGroq
@@ -20,16 +20,12 @@ from pydantic import BaseModel, Field
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
 from app.utils.token_utils import check_token_limit, add_tokens
-from transformers import logging
-logging.set_verbosity_error()
 
 load_dotenv()
 
 router = APIRouter(tags=["chat-youtube"])
 
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-mpnet-base-v2"
-)
+embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2-preview")
 
 vectorstore = PGVector(
     embeddings=embeddings,
