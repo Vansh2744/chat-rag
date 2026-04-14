@@ -22,8 +22,8 @@ load_dotenv()
 
 router = APIRouter(tags=["pdf-chat"])
 
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2-preview")
 llm = ChatGroq(model="llama-3.3-70b-versatile", streaming=True)
