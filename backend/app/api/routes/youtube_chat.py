@@ -16,17 +16,20 @@ import json
 import re
 from uuid import UUID
 from pydantic import BaseModel, Field
-
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
 from app.utils.token_utils import check_token_limit, add_tokens
 from functools import lru_cache
+import requests
 
 load_dotenv()
 
 router = APIRouter(tags=["chat-youtube"])
 
 embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2-preview")
+
+SUPADATA_API_KEY = os.environ.get("SUPADATA_API_KEY")
+
 
 @lru_cache(maxsize=1)
 def get_vectorstore():
@@ -36,6 +39,7 @@ def get_vectorstore():
         connection=os.environ.get("POSTGRES_URI"),
         pre_delete_collection=False,
     )
+
 
 llm = ChatGroq(model="llama-3.3-70b-versatile", streaming=True)
 
@@ -54,11 +58,33 @@ def extract_video_id(yt_url: str) -> str | None:
     return None
 
 
-def embed_youtube_video(yt_url: str, user_id: str, db: Session) -> dict:
-    video_id = extract_video_id(yt_url)
-    if not video_id:
-        raise HTTPException(status_code=422, detail="Invalid YouTube URL — could not extract video ID.")
+def get_transcript_supadata(video_id: str) -> str:
+    """Fetch transcript via Supadata API — works from cloud IPs."""
+    if not SUPADATA_API_KEY:
+        raise HTTPException(status_code=500, detail="Supadata API key not configured.")
 
+    response = requests.get(
+        "https://api.supadata.ai/v1/youtube/transcript",
+        headers={"x-api-key": SUPADATA_API_KEY},
+        params={"videoId": video_id, "lang": "en"},
+        timeout=15,
+    )
+
+    if response.status_code == 404:
+        raise HTTPException(status_code=422, detail="No transcript found for this video.")
+    if response.status_code != 200:
+        raise HTTPException(status_code=422, detail=f"Supadata error: {response.status_code}")
+
+    data = response.json()
+    content = data.get("content", [])
+    if not content:
+        raise HTTPException(status_code=422, detail="Transcript is empty.")
+
+    return " ".join(chunk["text"] for chunk in content)
+
+
+def get_transcript_youtube_api(video_id: str) -> str:
+    """Fallback: fetch transcript directly via youtube-transcript-api."""
     ytt = YouTubeTranscriptApi()
     try:
         fetched = ytt.fetch(video_id, languages=["en", "en-US", "en-GB", "hi"])
@@ -81,8 +107,31 @@ def embed_youtube_video(yt_url: str, user_id: str, db: Session) -> dict:
         full_text = " ".join(snippet.text for snippet in fetched)
     except AttributeError:
         full_text = " ".join(seg["text"] for seg in fetched)
+
     if not full_text.strip():
         raise HTTPException(status_code=422, detail="Transcript is empty.")
+
+    return full_text
+
+
+def get_transcript(video_id: str) -> str:
+    """Try Supadata first, fall back to youtube-transcript-api."""
+    if SUPADATA_API_KEY:
+        try:
+            return get_transcript_supadata(video_id)
+        except HTTPException:
+            raise 
+        except Exception:
+            pass 
+    return get_transcript_youtube_api(video_id)
+
+
+def embed_youtube_video(yt_url: str, user_id: str, db: Session) -> dict:
+    video_id = extract_video_id(yt_url)
+    if not video_id:
+        raise HTTPException(status_code=422, detail="Invalid YouTube URL — could not extract video ID.")
+
+    full_text = get_transcript(video_id)
 
     doc_id = str(uuid.uuid4())
     video_title = f"YouTube – {video_id}"
