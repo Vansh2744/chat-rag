@@ -45,6 +45,7 @@ export function ChatWithYouTube() {
   const { showModal, used, limit, handleStreamLimitError, closeModal } =
     useTokenLimit();
 
+
   useEffect(() => {
     fetchVideos();
   }, []);
@@ -384,6 +385,8 @@ export function ChatWithYouTube() {
         used={used}
         limit={limit}
       />
+
+      <div></div>
     </div>
   );
 }

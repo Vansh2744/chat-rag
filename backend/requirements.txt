@@ -132,4 +132,3 @@ youtube-transcript-api==1.2.3
 yt-dlp==2026.2.4
 zstandard==0.25.0
 langchain-google-genai
-requests

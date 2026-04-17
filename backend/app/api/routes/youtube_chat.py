@@ -10,38 +10,84 @@ from sqlalchemy.orm import Session
 from app.db.db import get_db
 from app.db.models import EmbeddedDocs
 from dotenv import load_dotenv
-import os
-import uuid
-import json
-import re
-from uuid import UUID
-from pydantic import BaseModel, Field
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
-from app.utils.token_utils import check_token_limit, add_tokens
 from functools import lru_cache
-import requests
+from pydantic import BaseModel, Field
+from uuid import UUID
+import os, uuid, json, re
+
+from youtube_transcript_api import (
+    YouTubeTranscriptApi,
+    NoTranscriptFound,
+    TranscriptsDisabled,
+    RequestBlocked,
+    IpBlocked,
+)
+from youtube_transcript_api.proxies import WebshareProxyConfig
 
 load_dotenv()
-
 router = APIRouter(tags=["chat-youtube"])
 
-embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2-preview")
 
-SUPADATA_API_KEY = os.environ.get("SUPADATA_API_KEY")
+def require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise HTTPException(status_code=500, detail=f"Missing environment variable: {name}")
+    return value
+
+
+def get_postgres_uri() -> str:
+    uri = os.getenv("POSTGRES_URI") or os.getenv("DATABASE_URL")
+    if not uri:
+        raise HTTPException(status_code=500, detail="Missing POSTGRES_URI / DATABASE_URL")
+
+    if uri.startswith("postgres://"):
+        uri = uri.replace("postgres://", "postgresql+psycopg://", 1)
+    elif uri.startswith("postgresql://") and not uri.startswith("postgresql+psycopg://"):
+        uri = uri.replace("postgresql://", "postgresql+psycopg://", 1)
+
+    if os.getenv("RENDER") == "true" and "sslmode=" not in uri:
+        uri += "&sslmode=require" if "?" in uri else "?sslmode=require"
+
+    return uri
+
+
+@lru_cache(maxsize=1)
+def get_embeddings():
+    require_env("GOOGLE_API_KEY")
+    return GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
+
+
+@lru_cache(maxsize=1)
+def get_llm():
+    require_env("GROQ_API_KEY")
+    return ChatGroq(model="llama-3.3-70b-versatile", streaming=True)
 
 
 @lru_cache(maxsize=1)
 def get_vectorstore():
     return PGVector(
-        embeddings=embeddings,
+        embeddings=get_embeddings(),
         collection_name="uploaded_file_data",
-        connection=os.environ.get("POSTGRES_URI"),
+        connection=get_postgres_uri(),
         pre_delete_collection=False,
+        create_extension=False,
     )
 
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", streaming=True)
+@lru_cache(maxsize=1)
+def get_youtube_client():
+    proxy_user = os.getenv("WEBSHARE_PROXY_USERNAME")
+    proxy_pass = os.getenv("WEBSHARE_PROXY_PASSWORD")
+
+    if proxy_user and proxy_pass:
+        return YouTubeTranscriptApi(
+            proxy_config=WebshareProxyConfig(
+                proxy_username=proxy_user,
+                proxy_password=proxy_pass,
+            )
+        )
+
+    return YouTubeTranscriptApi()
 
 
 def extract_video_id(yt_url: str) -> str | None:
@@ -58,190 +104,44 @@ def extract_video_id(yt_url: str) -> str | None:
     return None
 
 
-def get_transcript_supadata(video_id: str) -> str:
-    """Fetch transcript via Supadata API — works from cloud IPs."""
-    if not SUPADATA_API_KEY:
-        raise HTTPException(status_code=500, detail="Supadata API key not configured.")
+def embed_youtube_video(yt_url: str, user_id: str, db: Session) -> dict:
+    video_id = extract_video_id(yt_url)
+    if not video_id:
+        raise HTTPException(status_code=422, detail="Invalid YouTube URL")
 
-    response = requests.get(
-        "https://api.supadata.ai/v1/youtube/transcript",
-        headers={"x-api-key": SUPADATA_API_KEY},
-        params={"videoId": video_id, "lang": "en"},
-        timeout=15,
-    )
+    ytt = get_youtube_client()
 
-    if response.status_code == 404:
-        raise HTTPException(status_code=422, detail="No transcript found for this video.")
-    if response.status_code != 200:
-        raise HTTPException(status_code=422, detail=f"Supadata error: {response.status_code}")
-
-    data = response.json()
-    content = data.get("content", [])
-    if not content:
-        raise HTTPException(status_code=422, detail="Transcript is empty.")
-
-    return " ".join(chunk["text"] for chunk in content)
-
-
-def get_transcript_youtube_api(video_id: str) -> str:
-    """Fallback: fetch transcript directly via youtube-transcript-api."""
-    ytt = YouTubeTranscriptApi()
     try:
         fetched = ytt.fetch(video_id, languages=["en", "en-US", "en-GB", "hi"])
     except NoTranscriptFound:
         try:
-            tlist = ytt.list(video_id)
-            transcript = tlist.find_generated_transcript(["en", "hi"])
+            transcript = ytt.list(video_id).find_generated_transcript(["en", "hi"])
             fetched = transcript.fetch()
-        except Exception:
-            raise HTTPException(
-                status_code=422,
-                detail="No captions found. Try a video with subtitles or auto-captions enabled.",
-            )
+        except NoTranscriptFound:
+            raise HTTPException(status_code=422, detail="No captions found for this video.")
     except TranscriptsDisabled:
         raise HTTPException(status_code=422, detail="Transcripts are disabled for this video.")
+    except (RequestBlocked, IpBlocked):
+        raise HTTPException(
+            status_code=503,
+            detail="YouTube blocked the Render server IP. Configure a rotating residential proxy.",
+        )
     except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Could not fetch transcript: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Transcript fetch failed: {str(e)}")
 
-    try:
-        full_text = " ".join(snippet.text for snippet in fetched)
-    except AttributeError:
-        full_text = " ".join(seg["text"] for seg in fetched)
-
-    if not full_text.strip():
+    full_text = " ".join(snippet.text for snippet in fetched).strip()
+    if not full_text:
         raise HTTPException(status_code=422, detail="Transcript is empty.")
 
-    return full_text
-
-
-def get_transcript(video_id: str) -> str:
-    """Try Supadata first, fall back to youtube-transcript-api."""
-    if SUPADATA_API_KEY:
-        try:
-            return get_transcript_supadata(video_id)
-        except HTTPException:
-            raise 
-        except Exception:
-            pass 
-    return get_transcript_youtube_api(video_id)
-
-
-def embed_youtube_video(yt_url: str, user_id: str, db: Session) -> dict:
-    video_id = extract_video_id(yt_url)
-    if not video_id:
-        raise HTTPException(status_code=422, detail="Invalid YouTube URL — could not extract video ID.")
-
-    full_text = get_transcript(video_id)
-
     doc_id = str(uuid.uuid4())
-    video_title = f"YouTube – {video_id}"
-
     doc = Document(
         page_content=full_text,
-        metadata={
-            "doc_id": doc_id,
-            "source_type": "youtube",
-            "user_id": user_id,
-            "video_id": video_id,
-        },
+        metadata={"doc_id": doc_id, "source_type": "youtube", "user_id": user_id, "video_id": video_id},
     )
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    splits = splitter.split_documents([doc])
+    splits = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents([doc])
     for split in splits:
         split.metadata.update({"doc_id": doc_id, "source_type": "youtube", "user_id": user_id})
 
     get_vectorstore().add_documents(splits)
-
-    db_doc = EmbeddedDocs(
-        doc_name=video_title,
-        doc_id=doc_id,
-        user_id=user_id,
-        source_type="youtube",
-        source_url=yt_url,
-    )
-    db.add(db_doc)
-    db.commit()
-    db.refresh(db_doc)
-
-    return {"doc_id": doc_id, "video_title": video_title, "video_id": video_id}
-
-
-class ProcessVideoRequest(BaseModel):
-    model_config = {"arbitrary_types_allowed": True}
-
-    url: str = Field(..., description="Full YouTube video URL")
-    user_id: str = Field(..., description="User UUID as string")
-
-
-@router.post("/yt-chat/process-video")
-async def process_video(req: ProcessVideoRequest, db: Session = Depends(get_db)):
-    result = embed_youtube_video(req.url, req.user_id, db)
-    return {"message": "Video processed successfully", **result}
-
-
-@router.post("/yt-chat/chat")
-async def chat_with_yt(
-    question: str = Form(...),
-    user_id: str = Form(...),
-    doc_id: str = Form(...),
-    db: Session = Depends(get_db),
-):
-    usage = check_token_limit(user_id, db)
-
-    doc = (
-        db.query(EmbeddedDocs)
-        .filter(EmbeddedDocs.doc_id == doc_id, EmbeddedDocs.user_id == user_id)
-        .first()
-    )
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    results = get_vectorstore().similarity_search(question, k=5, filter={"doc_id": doc_id})
-    if not results:
-        raise HTTPException(status_code=404, detail="No relevant content found")
-
-    context = "\n\n".join([r.page_content for r in results])
-    system_prompt = (
-        "You are a helpful assistant. Answer the user's question using ONLY "
-        "the context below. If the answer is not in the context, say so.\n\n"
-        f"Context:\n{context}"
-    )
-
-    async def generate():
-        total_chars = 0
-        async for chunk in llm.astream([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=question),
-        ]):
-            if chunk.content:
-                total_chars += len(chunk.content)
-                yield f"data: {json.dumps({'content': chunk.content})}\n\n"
-
-        estimated_tokens = (total_chars + len(question) + len(context)) // 4
-        add_tokens(usage, estimated_tokens, db)
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
-
-
-@router.get("/yt-chat/videos/{user_id}")
-async def get_user_videos(user_id: UUID, db: Session = Depends(get_db)):
-    videos = (
-        db.query(EmbeddedDocs)
-        .filter(
-            EmbeddedDocs.user_id == user_id,
-            EmbeddedDocs.source_type == "youtube",
-        )
-        .order_by(EmbeddedDocs.created_at.desc())
-        .all()
-    )
-    return [
-        {
-            "doc_id": v.doc_id,
-            "doc_name": v.doc_name,
-            "source_url": v.source_url,
-            "created_at": v.created_at,
-        }
-        for v in videos
-    ]
+    return {"doc_id": doc_id, "video_title": f"YouTube - {video_id}", "video_id": video_id}
