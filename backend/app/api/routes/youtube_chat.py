@@ -10,10 +10,12 @@ from sqlalchemy.orm import Session
 from app.db.db import get_db
 from app.db.models import EmbeddedDocs
 from dotenv import load_dotenv
-from functools import lru_cache
-from pydantic import BaseModel, Field
+import os
+import uuid
+import json
+import re
 from uuid import UUID
-import os, uuid, json, re
+from pydantic import BaseModel, Field
 
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
@@ -23,10 +25,13 @@ from youtube_transcript_api import (
     IpBlocked,
 )
 from youtube_transcript_api.proxies import WebshareProxyConfig
+from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
+from app.utils.token_utils import check_token_limit, add_tokens
+from functools import lru_cache
 
 load_dotenv()
-router = APIRouter(tags=["chat-youtube"])
 
+router = APIRouter(tags=["chat-youtube"])
 
 def require_env(name: str) -> str:
     value = os.getenv(name)
@@ -57,10 +62,7 @@ def get_embeddings():
     return GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
 
 
-@lru_cache(maxsize=1)
-def get_llm():
-    require_env("GROQ_API_KEY")
-    return ChatGroq(model="llama-3.3-70b-versatile", streaming=True)
+llm = ChatGroq(model="llama-3.3-70b-versatile", streaming=True)
 
 
 @lru_cache(maxsize=1)
@@ -145,3 +147,82 @@ def embed_youtube_video(yt_url: str, user_id: str, db: Session) -> dict:
 
     get_vectorstore().add_documents(splits)
     return {"doc_id": doc_id, "video_title": f"YouTube - {video_id}", "video_id": video_id}
+    
+class ProcessVideoRequest(BaseModel):
+    model_config = {"arbitrary_types_allowed": True}
+
+    url: str = Field(..., description="Full YouTube video URL")
+    user_id: str = Field(..., description="User UUID as string")
+
+
+@router.post("/yt-chat/process-video")
+async def process_video(req: ProcessVideoRequest, db: Session = Depends(get_db)):
+    result = embed_youtube_video(req.url, req.user_id, db)
+    return {"message": "Video processed successfully", **result}
+
+
+@router.post("/yt-chat/chat")
+async def chat_with_yt(
+    question: str = Form(...),
+    user_id: str = Form(...),
+    doc_id: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    usage = check_token_limit(user_id, db)
+
+    doc = (
+        db.query(EmbeddedDocs)
+        .filter(EmbeddedDocs.doc_id == doc_id, EmbeddedDocs.user_id == user_id)
+        .first()
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    results = get_vectorstore().similarity_search(question, k=5, filter={"doc_id": doc_id})
+    if not results:
+        raise HTTPException(status_code=404, detail="No relevant content found")
+
+    context = "\n\n".join([r.page_content for r in results])
+    system_prompt = (
+        "You are a helpful assistant. Answer the user's question using ONLY "
+        "the context below. If the answer is not in the context, say so.\n\n"
+        f"Context:\n{context}"
+    )
+
+    async def generate():
+        total_chars = 0
+        async for chunk in llm.astream([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=question),
+        ]):
+            if chunk.content:
+                total_chars += len(chunk.content)
+                yield f"data: {json.dumps({'content': chunk.content})}\n\n"
+
+        estimated_tokens = (total_chars + len(question) + len(context)) // 4
+        add_tokens(usage, estimated_tokens, db)
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@router.get("/yt-chat/videos/{user_id}")
+async def get_user_videos(user_id: UUID, db: Session = Depends(get_db)):
+    videos = (
+        db.query(EmbeddedDocs)
+        .filter(
+            EmbeddedDocs.user_id == user_id,
+            EmbeddedDocs.source_type == "youtube",
+        )
+        .order_by(EmbeddedDocs.created_at.desc())
+        .all()
+    )
+    return [
+        {
+            "doc_id": v.doc_id,
+            "doc_name": v.doc_name,
+            "source_url": v.source_url,
+            "created_at": v.created_at,
+        }
+        for v in videos
+    ]
